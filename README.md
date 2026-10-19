@@ -16,9 +16,16 @@ library, no API key.
 
 ## How it works
 
-- Films come from the public Letterboxd RSS feed
-  (`letterboxd.com/{username}/rss/`), which exposes your ~50 most recent
-  diary entries: title, year, your star rating, watched date, and poster.
+- Films come from two public sources, merged: the RSS feed
+  (`letterboxd.com/{username}/rss/`, ~50 most recent diary entries with
+  watched dates and posters) and the first page of your public films grid
+  (`letterboxd.com/{username}/films/`, 72 films with ratings). Deeper grid
+  pages are Cloudflare-blocked for non-browser clients, so full history
+  comes from the official CSV export instead (below).
+- **Full history import**: download your export from
+  letterboxd.com/settings/data/ into `~/Downloads` (or `data/import/`),
+  then click "import full history" in the app. Posters for imported films
+  resolve lazily from film pages and are cached in `data/posters.json`.
 - Each unranked film is bisected into your ranked list:
   - **Better than** — search the upper half
   - **Worse than** — search the lower half

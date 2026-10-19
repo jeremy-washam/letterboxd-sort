@@ -238,6 +238,24 @@ button {
 #skipped { list-style: none; display: flex; flex-direction: column; gap: 6px; }
 .skip-row { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 14px; }
 
+.import-hint { margin-top: 20px; font-size: 13px; max-width: 420px; }
+.import-hint a { color: var(--blue); }
+
+#toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--card-hi);
+  color: var(--text);
+  padding: 12px 20px;
+  border-radius: 10px;
+  font-size: 14px;
+  box-shadow: 0 4px 24px rgba(0, 0, 0, 0.5);
+  max-width: 80vw;
+  z-index: 10;
+}
+
 @media (max-width: 680px) {
   .duel { flex-direction: column; align-items: center; }
   .vs { padding: 4px 0; }

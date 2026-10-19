@@ -1,5 +1,10 @@
+import csv
+import html
+import io
 import json
 import re
+import time
+import zipfile
 import urllib.error
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -22,11 +27,78 @@ def safe_username(raw):
     return name.lower()
 
 
-def fetch_films(username):
-    url = f"https://letterboxd.com/{username}/rss/"
+def http_get(url):
     req = urllib.request.Request(url, headers={"User-Agent": "letterboxd-ranker/0.1"})
     with urllib.request.urlopen(req, timeout=20) as resp:
-        xml = resp.read()
+        return resp.read()
+
+
+GRID_ITEM_RE = re.compile(r'<li class="griditem">(.*?)</li>', re.S)
+PAGE_LINK_RE = re.compile(r"/films/page/(\d+)/")
+
+
+def parse_grid_item(block, username):
+    slug_m = re.search(r'data-item-link="/film/([^/"]+)/"', block)
+    name_m = re.search(r'data-item-name="([^"]*)"', block)
+    id_m = re.search(r"film:(\d+)", block)
+    if not (slug_m and name_m and id_m):
+        return None
+    slug = slug_m.group(1)
+    name = html.unescape(name_m.group(1))
+    year = ""
+    title = name
+    ym = re.match(r"^(.*) \((\d{4})\)$", name)
+    if ym:
+        title, year = ym.group(1), ym.group(2)
+    film_id = id_m.group(1)
+    digits = "/".join(film_id)
+    rating = None
+    rm = re.search(r"rated-(\d+)", block)
+    if rm:
+        rating = f"{int(rm.group(1)) / 2:.1f}"
+    return {
+        "key": f"https://letterboxd.com/{username}/film/{slug}/",
+        "title": title,
+        "year": year,
+        "rating": rating,
+        "watched": "",
+        "poster": f"https://a.ltrbxd.com/resized/film-poster/{digits}/{film_id}-{slug}-0-600-0-900-crop.jpg",
+        "url": f"https://letterboxd.com/{username}/film/{slug}/",
+    }
+
+
+def scrape_profile_films(username):
+    films = {}
+    page = 1
+    last_page = 1
+    while page <= last_page:
+        url = (
+            f"https://letterboxd.com/{username}/films/"
+            if page == 1
+            else f"https://letterboxd.com/{username}/films/page/{page}/"
+        )
+        try:
+            body = http_get(url).decode()
+        except urllib.error.HTTPError:
+            # Cloudflare blocks /films/page/N/ for non-browser clients; keep what we have
+            if page == 1:
+                raise
+            break
+        if page == 1:
+            pages = [int(p) for p in PAGE_LINK_RE.findall(body)]
+            last_page = max(pages) if pages else 1
+        for block in GRID_ITEM_RE.findall(body):
+            film = parse_grid_item(block, username)
+            if film and film["key"] not in films:
+                films[film["key"]] = film
+        page += 1
+        if page <= last_page:
+            time.sleep(0.3)
+    return films
+
+
+def fetch_rss_films(username):
+    xml = http_get(f"https://letterboxd.com/{username}/rss/")
     root = ET.fromstring(xml)
     films = {}
     for item in root.iter("item"):
@@ -34,6 +106,7 @@ def fetch_films(username):
         if not title:
             continue
         link = (item.findtext("link") or "").strip()
+        link = re.sub(r"(/film/[^/]+)/\d+/?$", r"\1/", link)
         if not link or link in films:
             continue
         desc = item.findtext("description") or ""
@@ -51,6 +124,95 @@ def fetch_films(username):
             "url": link,
         }
     return list(films.values())
+
+
+def fetch_films(username):
+    films = scrape_profile_films(username)
+    for film in fetch_rss_films(username):
+        existing = films.get(film["key"])
+        if existing:
+            existing["watched"] = film["watched"]
+            if film.get("rating"):
+                existing["rating"] = film["rating"]
+            if film.get("poster"):
+                existing["poster"] = film["poster"]
+        else:
+            films[film["key"]] = film
+    return list(films.values())
+
+
+def find_export_zip(username):
+    candidates = []
+    for folder in [Path.home() / "Downloads", DATA / "import", ROOT]:
+        if folder.is_dir():
+            candidates += folder.glob(f"letterboxd-{username}-*.zip")
+    if not candidates:
+        return None
+    return max(candidates, key=lambda p: p.stat().st_mtime)
+
+
+def import_export_zip(username):
+    path = find_export_zip(username)
+    if not path:
+        raise FileNotFoundError(
+            f"No export zip found. Download yours from letterboxd.com/settings/data/ "
+            f"into ~/Downloads (it will be named letterboxd-{username}-....zip) and retry."
+        )
+
+    def read_csv(zf, name):
+        try:
+            with zf.open(name) as f:
+                return list(csv.DictReader(io.TextIOWrapper(f, encoding="utf-8")))
+        except KeyError:
+            return []
+
+    with zipfile.ZipFile(path) as zf:
+        watched = read_csv(zf, "watched.csv")
+        ratings = read_csv(zf, "ratings.csv")
+
+    rating_by_uri = {r["Letterboxd URI"]: r.get("Rating") for r in ratings if r.get("Letterboxd URI")}
+    films = []
+    for row in watched:
+        uri = (row.get("Letterboxd URI") or "").strip()
+        if not uri:
+            continue
+        films.append({
+            "key": uri,
+            "title": row.get("Name") or "",
+            "year": row.get("Year") or "",
+            "rating": rating_by_uri.get(uri),
+            "watched": row.get("Date") or "",
+            "poster": None,
+            "url": uri,
+        })
+    return {"films": films, "source": path.name}
+
+
+POSTER_CACHE = DATA / "posters.json"
+
+
+def resolve_poster(uri):
+    DATA.mkdir(exist_ok=True)
+    cache = json.loads(POSTER_CACHE.read_text()) if POSTER_CACHE.exists() else {}
+    if uri in cache:
+        return cache[uri]
+    if not re.match(r"^https://(boxd\.it|letterboxd\.com)/", uri):
+        raise ValueError("not a letterboxd url")
+    req = urllib.request.Request(uri, headers={"User-Agent": "letterboxd-ranker/0.1"})
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        body = resp.read().decode()
+        film_url = resp.url
+    poster = None
+    m = re.search(r'<script type="application/ld\+json">\s*(?:/\*.*?\*/)?\s*(\{.*?\})\s*(?:/\*.*?\*/)?\s*</script>', body, re.S)
+    if m:
+        try:
+            poster = json.loads(m.group(1)).get("image")
+        except json.JSONDecodeError:
+            pass
+    result = {"poster": poster, "filmUrl": film_url}
+    cache[uri] = result
+    POSTER_CACHE.write_text(json.dumps(cache, indent=2))
+    return result
 
 
 def state_path(username):
@@ -95,6 +257,12 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/films":
                 username = self.query_username(parsed.query)
                 self.send_json({"films": fetch_films(username)})
+            elif route == "/api/import":
+                username = self.query_username(parsed.query)
+                self.send_json(import_export_zip(username))
+            elif route == "/api/poster":
+                uri = parse_qs(parsed.query).get("uri", [""])[0]
+                self.send_json(resolve_poster(uri))
             elif route == "/api/state":
                 username = self.query_username(parsed.query)
                 path = state_path(username)
@@ -104,7 +272,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_json({"films": {}, "ranked": [], "skipped": []})
             else:
                 self.send_json({"error": "not found"}, 404)
-        except ValueError as e:
+        except (ValueError, FileNotFoundError) as e:
             self.send_json({"error": str(e)}, 400)
         except urllib.error.HTTPError as e:
             msg = "user not found" if e.code == 404 else f"letterboxd returned {e.code}"

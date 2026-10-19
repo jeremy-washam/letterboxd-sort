@@ -66,13 +66,22 @@
       <h2>All caught up 🎬</h2>
       <p class="muted">Every film from your feed is ranked. Watch more movies, then hit refresh.</p>
       <button id="btn-refresh" class="primary">Refresh feed</button>
+      <p class="muted import-hint">Only recent films show up automatically. For everything you've ever
+        logged, download your export from
+        <a href="https://letterboxd.com/settings/data/" target="_blank" rel="noopener">letterboxd.com/settings/data</a>
+        into Downloads, then
+        <button id="btn-import" class="link-btn">import full watch history</button>
+      </p>
     </div>
   </section>
 
   <section id="view-list" class="hidden">
     <div class="list-head">
       <h2>My ranking</h2>
-      <button id="btn-refresh-2" class="link-btn">refresh feed</button>
+      <span>
+        <button id="btn-import-2" class="link-btn">import full history</button>
+        <button id="btn-refresh-2" class="link-btn">refresh feed</button>
+      </span>
     </div>
     <ol id="ranking"></ol>
     <div id="skipped-section" class="hidden">
@@ -81,6 +90,8 @@
     </div>
   </section>
 </main>
+
+<div id="toast" class="hidden"></div>
 
 <script src="/app.js"></script>
 </body>

@@ -34,6 +34,132 @@ function saveState() {
   }).catch(() => {});
 }
 
+const canonical = (url) => (url || "").replace(/(\/film\/[^/]+)\/\d+\/?$/, "$1/");
+const titleYear = (f) => `${(f.title || "").toLowerCase()}|${f.year || ""}`;
+
+function titleYearIndex() {
+  const index = {};
+  for (const f of Object.values(state.films)) index[titleYear(f)] = f.key;
+  return index;
+}
+
+function remapKey(oldKey, newKey) {
+  state.ranked = state.ranked.map((k) => (k === oldKey ? newKey : k));
+  state.skipped = state.skipped.map((k) => (k === oldKey ? newKey : k));
+}
+
+function mergeFeedFilm(film, index) {
+  const existingKey = state.films[film.key] ? film.key : index[titleYear(film)];
+  if (existingKey) {
+    const old = state.films[existingKey];
+    state.films[film.key] = {
+      ...old,
+      ...film,
+      watched: film.watched || old.watched,
+      poster: film.poster || old.poster,
+      rating: film.rating ?? old.rating,
+    };
+    if (existingKey !== film.key) {
+      delete state.films[existingKey];
+      remapKey(existingKey, film.key);
+    }
+  } else {
+    state.films[film.key] = film;
+  }
+  index[titleYear(film)] = film.key;
+}
+
+function rebuildQueue() {
+  const placed = new Set([...state.ranked, ...state.skipped]);
+  queue = Object.values(state.films)
+    .filter((f) => !placed.has(f.key))
+    .sort((a, b) => (b.watched || "").localeCompare(a.watched || ""))
+    .map((f) => f.key);
+  totalToPlace = placedThisSession + queue.length;
+}
+
+let toastTimer = null;
+function toast(msg) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.classList.remove("hidden");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.add("hidden"), 5000);
+}
+
+const posterQueue = [];
+const posterQueued = new Set();
+let posterWorking = false;
+
+function queuePoster(film, imgEl, priority) {
+  if (film.poster || !/^https:\/\/boxd\.it\//.test(film.key) || posterQueued.has(film.key)) return;
+  posterQueued.add(film.key);
+  posterQueue[priority ? "unshift" : "push"]([film.key, imgEl]);
+  pumpPosters();
+}
+
+async function pumpPosters() {
+  if (posterWorking) return;
+  posterWorking = true;
+  while (posterQueue.length) {
+    const [key, img] = posterQueue.shift();
+    const film = state.films[key];
+    posterQueued.delete(key);
+    if (!film || film.poster) continue;
+    try {
+      const res = await api(`/api/poster?uri=${encodeURIComponent(key)}`);
+      if (res.poster) film.poster = res.poster;
+      if (res.filmUrl) film.url = res.filmUrl;
+      saveState();
+      if (img && img.dataset.key === key && res.poster) img.src = res.poster;
+    } catch {
+      // leave poster missing; placeholder background shows instead
+    }
+  }
+  posterWorking = false;
+}
+
+async function importHistory() {
+  toast("Looking for your export zip…");
+  try {
+    const res = await api(`/api/import?username=${encodeURIComponent(username)}`);
+    const index = titleYearIndex();
+    let added = 0;
+    for (const film of res.films) {
+      const existingKey = state.films[film.key] ? film.key : index[titleYear(film)];
+      if (existingKey) {
+        const old = state.films[existingKey];
+        old.watched = old.watched || film.watched;
+        old.rating = old.rating ?? film.rating;
+      } else {
+        state.films[film.key] = film;
+        index[titleYear(film)] = film.key;
+        added++;
+      }
+    }
+    rebuildQueue();
+    saveState();
+    toast(`Imported ${res.films.length} films from ${res.source} — ${added} new to rank.`);
+    nextCandidate();
+  } catch (err) {
+    toast(err.message);
+  }
+}
+
+function migrate(saved) {
+  const films = {};
+  for (const [key, film] of Object.entries(saved.films || {})) {
+    const canon = canonical(film.url || key);
+    if (!films[canon]) films[canon] = { ...film, key: canon, url: canon };
+  }
+  const seen = new Set();
+  const remap = (keys) =>
+    (keys || [])
+      .map(canonical)
+      .filter((k) => films[k] && !seen.has(k) && seen.add(k));
+  return { films, ranked: remap(saved.ranked), skipped: remap(saved.skipped) };
+}
+
 async function init(name) {
   username = name;
   localStorage.setItem("lbx-username", username);
@@ -44,21 +170,13 @@ async function init(name) {
     api(`/api/state?username=${encodeURIComponent(username)}`),
     api(`/api/films?username=${encodeURIComponent(username)}`),
   ]);
-  state = { films: saved.films || {}, ranked: saved.ranked || [], skipped: saved.skipped || [] };
-  for (const film of feed.films) {
-    if (!state.films[film.key]) state.films[film.key] = film;
-    else state.films[film.key] = { ...state.films[film.key], ...film };
-  }
+  state = migrate(saved);
+  const index = titleYearIndex();
+  for (const film of feed.films) mergeFeedFilm(film, index);
 
-  const placed = new Set([...state.ranked, ...state.skipped]);
-  queue = Object.values(state.films)
-    .filter((f) => !placed.has(f.key))
-    .sort((a, b) => (b.watched || "").localeCompare(a.watched || ""))
-    .map((f) => f.key);
-
-  totalToPlace = queue.length;
   placedThisSession = 0;
   undoStack = [];
+  rebuildQueue();
   saveState();
   nextCandidate();
 }
@@ -92,6 +210,10 @@ function renderComparison() {
   $("compare-question").textContent = `Is ${cand.title} better than ${pivot.title}?`;
   $("poster-candidate").src = cand.poster || "";
   $("poster-candidate").alt = cand.title;
+  $("poster-candidate").dataset.key = cand.key;
+  $("poster-pivot").dataset.key = pivot.key;
+  queuePoster(cand, $("poster-candidate"), true);
+  queuePoster(pivot, $("poster-pivot"), true);
   $("title-candidate").textContent = cand.title;
   $("year-candidate").textContent = cand.year;
   $("poster-pivot").src = pivot.poster || "";
@@ -190,7 +312,7 @@ function renderList() {
     li.className = "rank-row";
     li.innerHTML = `
       <span class="rank-num">${i + 1}</span>
-      <img src="${film.poster || ""}" alt="" loading="lazy">
+      <img src="${film.poster || ""}" alt="" loading="lazy" data-key="${film.key}">
       <span class="rank-info">
         <a href="${film.url}" target="_blank" rel="noopener">${film.title} <span class="film-year">${film.year}</span></a>
         <span class="rank-sub">${film.rating ? `★ ${film.rating} on letterboxd` : "unrated"}${film.watched ? ` · watched ${film.watched}` : ""}</span>
@@ -198,6 +320,7 @@ function renderList() {
       <span class="score ${scoreClass(parseFloat(s))}">${s}</span>
       <button class="link-btn" data-rerank="${key}">re-rank</button>`;
     ol.appendChild(li);
+    queuePoster(film, li.querySelector("img"), false);
   });
 
   const skippedUl = $("skipped");
@@ -262,6 +385,9 @@ $("switch-user").addEventListener("click", () => {
 
 for (const id of ["btn-refresh", "btn-refresh-2"]) {
   $(id).addEventListener("click", () => init(username));
+}
+for (const id of ["btn-import", "btn-import-2"]) {
+  $(id).addEventListener("click", importHistory);
 }
 
 document.addEventListener("click", (e) => {
